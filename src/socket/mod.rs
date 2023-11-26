@@ -136,6 +136,7 @@ impl Socket {
                         if let Some(target) = &packet.target {
                             if let Some(listeners) = listener_guard.get(target) {
                                 listeners.iter().for_each(|listener| {
+                                    // TODO: get rid of clone
                                     tokio::spawn(listener(packet.clone()));
                                 });
                             }
