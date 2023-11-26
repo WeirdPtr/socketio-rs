@@ -221,11 +221,7 @@ impl Socket {
     async fn inner_ping(
         write: Arc<Mutex<SocketWriteSink>>,
     ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        write
-            .lock()
-            .await
-            .send(Message::Text(PacketType::Ping.into()))
-            .await
+        Self::send_raw(write, PacketType::Ping.into()).await
     }
 
     pub async fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
@@ -299,14 +295,14 @@ impl Socket {
             ping_interval: self.ping_interval,
         };
 
-        let handshake_message = Message::Text(Packet::encode(Packet::new_raw(
+        let handshake_packet = Packet::new_raw(
             PacketType::Connect,
             None,
             None,
             serde_json::to_string(&handshake)?,
-        )));
+        );
 
-        let _ = self.write.lock().await.send(handshake_message).await;
+        Self::send_raw_packet(self.write(), handshake_packet).await?;
 
         let handshake_response = self.read.lock().await.next().await;
 
@@ -334,11 +330,27 @@ impl Socket {
         Ok(())
     }
 
-    pub async fn send_packet(&self, packet: Packet) -> Result<(), Box<dyn std::error::Error>> {
-        self.write
+    pub async fn send_raw(
+        write: Arc<Mutex<SocketWriteSink>>,
+        payload: String,
+    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+        write
             .lock()
             .await
-            .send(Message::Text(Packet::encode(packet)))
+            .send(Message::Text(payload))
+            .await
+            .map_err(|e| e.into())
+    }
+
+    pub async fn send_raw_packet(
+        write: Arc<Mutex<SocketWriteSink>>,
+        payload: Packet,
+    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+        Self::send_raw(write, Packet::encode(payload)).await
+    }
+
+    pub async fn send_packet(&self, packet: Packet) -> Result<(), Box<dyn std::error::Error>> {
+        Self::send_raw_packet(self.write(), packet)
             .await
             .map_err(|e| e.into())
     }
