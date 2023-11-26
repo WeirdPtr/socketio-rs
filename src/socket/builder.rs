@@ -1,4 +1,4 @@
-use super::Socket;
+use super::{Socket, SocketReadStream, SocketWriteSink};
 use crate::{
     enums::{connection::ConnectionType, protocol::ProtocolVersion},
     parser::Packet,
@@ -10,7 +10,10 @@ use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::Request, protocol::WebSocketConfig,
 };
 
-pub type SocketListenerFn = dyn Fn(Packet) -> BoxFuture<'static, ()> + Send + Sync + 'static;
+pub type SocketListenerFn = dyn Fn(Packet, Arc<Mutex<SocketReadStream>>, Arc<Mutex<SocketWriteSink>>) -> BoxFuture<'static, ()>
+    + Send
+    + Sync
+    + 'static;
 
 pub struct SocketBuilder {
     protocol: ProtocolVersion,
@@ -172,7 +175,14 @@ impl SocketBuilder {
     pub fn on<'e, E, L>(mut self, event: E, listener: L) -> Self
     where
         E: Into<&'e str>,
-        L: for<'a> Fn(Packet) -> BoxFuture<'static, ()> + 'static + Send + Sync,
+        L: for<'a> Fn(
+                Packet,
+                Arc<Mutex<SocketReadStream>>,
+                Arc<Mutex<SocketWriteSink>>,
+            ) -> BoxFuture<'static, ()>
+            + 'static
+            + Send
+            + Sync,
     {
         self.listener_boxed(event, Box::new(listener));
         self
@@ -180,7 +190,14 @@ impl SocketBuilder {
 
     pub fn on_any<L>(mut self, listener: L) -> Self
     where
-        L: for<'a> Fn(Packet) -> BoxFuture<'static, ()> + 'static + Send + Sync,
+        L: for<'a> Fn(
+                Packet,
+                Arc<Mutex<SocketReadStream>>,
+                Arc<Mutex<SocketWriteSink>>,
+            ) -> BoxFuture<'static, ()>
+            + 'static
+            + Send
+            + Sync,
     {
         self.wildcard_listener = Some(Arc::new(Box::new(listener)));
         self

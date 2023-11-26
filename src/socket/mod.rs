@@ -15,14 +15,14 @@ use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 pub mod builder;
 
 #[cfg(not(feature = "proxy"))]
-type SocketWriteSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+pub type SocketWriteSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 #[cfg(not(feature = "proxy"))]
-type SocketReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+pub type SocketReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 #[cfg(feature = "proxy")]
-type SocketWriteSink = SplitSink<WebSocketStream<TcpStream>, Message>;
+pub type SocketWriteSink = SplitSink<WebSocketStream<TcpStream>, Message>;
 #[cfg(feature = "proxy")]
-type SocketReadStream = SplitStream<WebSocketStream<TcpStream>>;
+pub type SocketReadStream = SplitStream<WebSocketStream<TcpStream>>;
 
 pub struct Socket {
     read: Arc<Mutex<SocketReadStream>>,
@@ -62,6 +62,9 @@ impl Socket {
 
         let ping_interval = self.ping_interval;
 
+        let ping_read_guard = self.read();
+        let ping_write_guard = self.write();
+
         let ping_handle = tokio::spawn(async move {
             let ping_interval =
                 std::time::Duration::from_millis(ping_interval.try_into().unwrap_or(25_000));
@@ -76,7 +79,11 @@ impl Socket {
                     .unwrap_or(&vec![])
                     .iter()
                     .for_each(|listener| {
-                        tokio::spawn(listener(Packet::new(PacketType::Ping, None, None, None)));
+                        tokio::spawn(listener(
+                            Packet::new(PacketType::Ping, None, None, None),
+                            ping_read_guard.clone(),
+                            ping_write_guard.clone(),
+                        ));
                     });
 
                 let ping_result = Self::inner_ping(ping_write.clone()).await;
@@ -90,7 +97,11 @@ impl Socket {
                     .unwrap_or(&vec![])
                     .iter()
                     .for_each(|listener| {
-                        tokio::spawn(listener(Packet::new(PacketType::Ping, None, None, None)));
+                        tokio::spawn(listener(
+                            Packet::new(PacketType::Ping, None, None, None),
+                            ping_read_guard.clone(),
+                            ping_write_guard.clone(),
+                        ));
                     });
             }
         });
@@ -100,10 +111,13 @@ impl Socket {
         let wildcard_listener = self
             .wildcard_listener
             .as_ref()
-            .unwrap_or(&Arc::new(Box::new(|_| Box::pin(async {}))))
+            .unwrap_or(&Arc::new(Box::new(|_, _, _| Box::pin(async {}))))
             .clone();
 
         let listener_guard = self.listeners.clone();
+
+        let worker_read_guard = self.read();
+        let worker_write_guard = self.write();
 
         let worker_handle = tokio::spawn(async move {
             loop {
@@ -137,12 +151,20 @@ impl Socket {
                             if let Some(listeners) = listener_guard.get(target) {
                                 listeners.iter().for_each(|listener| {
                                     // TODO: get rid of clone
-                                    tokio::spawn(listener(packet.clone()));
+                                    tokio::spawn(listener(
+                                        packet.clone(),
+                                        worker_read_guard.clone(),
+                                        worker_write_guard.clone(),
+                                    ));
                                 });
                             }
                         }
 
-                        tokio::spawn(wildcard_listener(packet));
+                        tokio::spawn(wildcard_listener(
+                            packet,
+                            worker_read_guard.clone(),
+                            worker_write_guard.clone(),
+                        ));
                     }
                     Message::Close(_) => listener_guard
                         .lock()
@@ -151,12 +173,11 @@ impl Socket {
                         .unwrap_or(&vec![])
                         .iter()
                         .for_each(|listener| {
-                            tokio::spawn(listener(Packet::new(
-                                PacketType::Event,
-                                None,
-                                None,
-                                None,
-                            )));
+                            tokio::spawn(listener(
+                                Packet::new(PacketType::Event, None, None, None),
+                                worker_read_guard.clone(),
+                                worker_write_guard.clone(),
+                            ));
                         }),
                     _ => { /* Ignore */ }
                 }
@@ -210,7 +231,14 @@ impl Socket {
     pub async fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
     where
         E: Into<&'e str>,
-        L: for<'a> Fn(Packet) -> BoxFuture<'static, ()> + 'static + Send + Sync,
+        L: for<'a> Fn(
+                Packet,
+                Arc<Mutex<SocketReadStream>>,
+                Arc<Mutex<SocketWriteSink>>,
+            ) -> BoxFuture<'static, ()>
+            + 'static
+            + Send
+            + Sync,
     {
         self.listener_boxed(event, Box::new(listener)).await;
         self
@@ -223,15 +251,14 @@ impl Socket {
         if listeners.is_some() {
             let listeners = listeners.unwrap();
 
-            for listener in listeners {
-                let listener = listener(data.clone());
-
-                tokio::spawn(listener);
-            }
+            listeners.iter().for_each(|listener| {
+                tokio::spawn(listener(data.clone(), self.read(), self.write()));
+            });
         }
 
         if self.wildcard_listener.is_some() {
-            let listener = self.wildcard_listener.as_ref().unwrap()(data);
+            let listener =
+                self.wildcard_listener.as_ref().unwrap()(data, self.read(), self.write());
 
             tokio::spawn(listener);
         }
@@ -239,7 +266,14 @@ impl Socket {
 
     pub fn on_any<L>(&mut self, listener: L) -> &mut Self
     where
-        L: for<'a> Fn(Packet) -> BoxFuture<'static, ()> + 'static + Send + Sync,
+        L: for<'a> Fn(
+                Packet,
+                Arc<Mutex<SocketReadStream>>,
+                Arc<Mutex<SocketWriteSink>>,
+            ) -> BoxFuture<'static, ()>
+            + 'static
+            + Send
+            + Sync,
     {
         self.wildcard_listener = Some(Arc::new(Box::new(listener)));
         self
