@@ -85,13 +85,13 @@ impl Packet {
 
         let (chunk_identifier, payload) = chunk_str.split_once(',').unwrap_or(("", ""));
 
-        let (chunk_identifier, target) = chunk_identifier
+        let (chunk_identifier, namespace) = chunk_identifier
             .split_once('/')
             .unwrap_or((chunk_identifier, ""));
 
-        let target = match target.is_empty() {
+        let namespace = match namespace.is_empty() {
             true => None,
-            false => Some(target.to_owned()),
+            false => Some(namespace.to_owned()),
         };
 
         let packet_type: PacketType = chunk_identifier
@@ -103,16 +103,29 @@ impl Packet {
             .into();
 
         if chunk_len < 5 {
-            return Ok(Packet::new(packet_type, None, target, None));
+            return Ok(Packet::new(packet_type, namespace, None, None));
         }
 
         let mut parsed_payload = None;
+        let mut target = None;
 
         if !payload.is_empty() {
-            parsed_payload = serde_json::from_str::<serde_json::Value>(payload).ok();
+            if payload.starts_with('[') {
+                let (target_str, payload) = payload[1..payload.len() - 1]
+                    .split_once(',')
+                    .unwrap_or(("", ""));
+
+                if !target_str.is_empty() {
+                    target = Some(target_str[1..target_str.len() - 1].to_owned());
+                }
+
+                parsed_payload = serde_json::from_str::<serde_json::Value>(payload).ok();
+            } else {
+                parsed_payload = serde_json::from_str::<serde_json::Value>(payload).ok();
+            }
         }
 
-        Ok(Packet::new(packet_type, None, target, parsed_payload))
+        Ok(Packet::new(packet_type, namespace, target, parsed_payload))
     }
 
     pub fn decode_raw<'p>(
