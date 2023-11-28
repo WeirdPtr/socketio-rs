@@ -15,16 +15,20 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new(
+    pub fn new<N, T>(
         packet_type: PacketType,
-        nsp: Option<String>,
-        target: Option<String>,
+        nsp: Option<N>,
+        target: Option<T>,
         data: Option<serde_json::Value>,
-    ) -> Self {
+    ) -> Self
+    where
+        N: Into<String>,
+        T: Into<String>,
+    {
         Packet {
             packet_type,
-            nsp,
-            target,
+            nsp: nsp.map(|n| n.into()),
+            target: target.map(|t| t.into()),
             data,
         }
     }
