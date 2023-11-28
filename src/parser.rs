@@ -15,7 +15,21 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new<N, T>(
+    pub fn new(
+        packet_type: PacketType,
+        nsp: Option<String>,
+        target: Option<String>,
+        data: Option<serde_json::Value>,
+    ) -> Self {
+        Packet {
+            packet_type,
+            nsp,
+            target,
+            data,
+        }
+    }
+
+    pub fn new_typed<N, T>(
         packet_type: PacketType,
         nsp: Option<N>,
         target: Option<T>,

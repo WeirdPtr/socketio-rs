@@ -330,16 +330,18 @@ impl Socket {
         Ok(())
     }
 
+    pub async fn send_raw_with_type(
+        write: Arc<Mutex<SocketWriteSink>>,
+        payload: Message,
+    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+        write.lock().await.send(payload).await.map_err(|e| e.into())
+    }
+
     pub async fn send_raw(
         write: Arc<Mutex<SocketWriteSink>>,
         payload: String,
     ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        write
-            .lock()
-            .await
-            .send(Message::Text(payload))
-            .await
-            .map_err(|e| e.into())
+        Self::send_raw_with_type(write, Message::Text(payload)).await
     }
 
     pub async fn send_raw_packet(
