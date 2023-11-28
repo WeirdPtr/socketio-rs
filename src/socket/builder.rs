@@ -278,8 +278,6 @@ impl SocketBuilder {
             self.ping_interval,
         );
 
-        socket.handshake().await?;
-
         Ok(socket)
     }
 }
