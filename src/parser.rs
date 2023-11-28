@@ -185,6 +185,10 @@ impl Packet {
     pub fn encode(packet: Packet) -> String {
         let mut namespace = String::new();
 
+        if packet.nsp.is_none() && packet.target.is_none() && packet.data.is_none() {
+            return format!("{packet_type}", packet_type = packet.packet_type as u8);
+        }
+
         if let Some(nsp) = packet.nsp {
             namespace = format!("/{}", nsp);
         }
@@ -205,15 +209,15 @@ impl Packet {
                     packet_type = packet.packet_type as u8
                 )
             }
-            PacketType::Message => {
+            PacketType::Message | PacketType::Ping => {
                 if let Some(target) = packet.target {
                     format!(
-                        "{packet_type}{namespace}[\"{target}\",{data}]",
+                        "{packet_type}{namespace},[\"{target}\",{data}]",
                         packet_type = packet.packet_type as u8,
                     )
                 } else {
                     format!(
-                        "{packet_type}{namespace}[{data}]",
+                        "{packet_type}{namespace},[{data}]",
                         packet_type = packet.packet_type as u8,
                     )
                 }

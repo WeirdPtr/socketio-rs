@@ -147,7 +147,7 @@ impl SocketBuilder {
     }
 
     #[cfg(feature = "proxy")]
-    pub fn proxy<P>(&mut self, proxy: P) -> &mut Self
+    pub fn proxy<P>(mut self, proxy: P) -> Self
     where
         P: Into<String>,
     {
@@ -224,15 +224,13 @@ impl SocketBuilder {
 
         let (write, read) = ws_stream.split();
 
-        let mut socket = Socket::new(
+        let socket = Socket::new(
             read,
             write,
             Some(Arc::new(Mutex::new(self.listeners))),
             self.wildcard_listener,
             self.ping_interval,
         );
-
-        socket.handshake().await?;
 
         Ok(socket)
     }
@@ -252,9 +250,13 @@ impl SocketBuilder {
 
         let proxy = self.proxy.clone().unwrap_or(
             std::env::var("HTTP_PROXY")
-                .unwrap_or(std::env::var("HTTPS_PROXY")?)
+                .unwrap_or(std::env::var("HTTPS_PROXY").unwrap_or(String::new()))
                 .to_owned(),
         );
+
+        if proxy.is_empty() {
+            return Err("No proxy provided".into());
+        }
 
         let proxy = InnerProxy::from_proxy_str(proxy.as_str())?;
 
@@ -263,13 +265,12 @@ impl SocketBuilder {
             .await?
             .into();
 
-        let (write, read) =
-            client_async_with_config(self.request.uri().to_string(), proxy_stream, Some(config))
-                .await?
-                .0
-                .split();
+        let (write, read) = client_async_with_config(self.request, proxy_stream, Some(config))
+            .await?
+            .0
+            .split();
 
-        let mut socket = Socket::new(
+        let socket = Socket::new(
             read,
             write,
             Some(Arc::new(Mutex::new(self.listeners))),
