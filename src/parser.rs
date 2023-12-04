@@ -212,10 +212,18 @@ impl Packet {
         }
 
         if packet.data.is_none() {
-            return format!(
-                "{packet_type}{namespace},",
-                packet_type = packet.packet_type as u8
-            );
+            if packet.target.is_some() {
+                return format!(
+                    "{packet_type}{namespace},[\"{target}\"]",
+                    packet_type = packet.packet_type as u8,
+                    target = packet.target.unwrap()
+                );
+            } else {
+                return format!(
+                    "{packet_type}{namespace},",
+                    packet_type = packet.packet_type as u8
+                );
+            }
         }
 
         let data = packet.data.unwrap().to_string();
