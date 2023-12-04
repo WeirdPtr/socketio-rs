@@ -215,12 +215,10 @@ impl SocketBuilder {
         let config = WebSocketConfig {
             max_message_size: Some(usize::MAX),
             max_frame_size: Some(usize::MAX),
-            accept_unmasked_frames: true,
             ..Default::default()
         };
 
-        let (ws_stream, _) =
-            connect_async_with_config(self.request.uri().to_owned(), Some(config), false).await?;
+        let (ws_stream, _) = connect_async_with_config(self.request, Some(config), false).await?;
 
         let (write, read) = ws_stream.split();
 
@@ -244,7 +242,6 @@ impl SocketBuilder {
         let config = WebSocketConfig {
             max_message_size: Some(usize::MAX),
             max_frame_size: Some(usize::MAX),
-            accept_unmasked_frames: true,
             ..Default::default()
         };
 
