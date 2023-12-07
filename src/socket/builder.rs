@@ -172,7 +172,7 @@ impl SocketBuilder {
         self
     }
 
-    pub fn on<'e, E, L>(mut self, event: E, listener: L) -> Self
+    pub fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
     where
         E: Into<&'e str>,
         L: for<'a> Fn(
@@ -188,7 +188,7 @@ impl SocketBuilder {
         self
     }
 
-    pub fn on_any<L>(mut self, listener: L) -> Self
+    pub fn on_any<L>(&mut self, listener: L) -> &mut Self
     where
         L: for<'a> Fn(
                 Packet,
