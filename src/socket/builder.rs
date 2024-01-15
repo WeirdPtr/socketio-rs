@@ -3,6 +3,7 @@ use crate::{
     enums::{connection::ConnectionType, protocol::ProtocolVersion},
     get_empty_body,
     parser::Packet,
+    structs::reconnect::ReconnectConfiguration,
     util::crate_user_agent,
     Request,
 };
@@ -27,7 +28,7 @@ pub type SocketListenerFn = dyn Fn(
     + Sync
     + 'static;
 
-struct SpawnExecutor;
+pub(crate) struct SpawnExecutor;
 impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
 where
     Fut: std::future::Future + Send + 'static,
@@ -47,6 +48,8 @@ pub struct SocketBuilder {
     listeners: HashMap<String, Vec<Box<SocketListenerFn>>>,
     wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
     force_handshake: bool,
+    enable_reconnect: bool,
+    max_reconnect_count: Option<u8>,
     #[cfg(feature = "proxy")]
     proxy: Option<String>,
     #[cfg(feature = "proxy")]
@@ -57,7 +60,7 @@ pub struct SocketBuilder {
 
 #[cfg(feature = "proxy")]
 impl SocketBuilder {
-    pub fn proxy<P>(mut self, proxy: P) -> Self
+    pub fn proxy<P>(&mut self, proxy: P) -> &mut Self
     where
         P: Into<String>,
     {
@@ -72,6 +75,66 @@ impl SocketBuilder {
 
     pub fn ignore_proxy_env_vars(&mut self, ignore: bool) -> &mut Self {
         self.ignore_proxy_env_vars = ignore;
+        self
+    }
+}
+
+impl SocketBuilder {
+    pub fn protocol(&mut self, protocol: ProtocolVersion) -> &mut Self {
+        self.protocol = protocol;
+        self
+    }
+
+    pub fn connection_type(&mut self, connection_type: ConnectionType) -> &mut Self {
+        self.connection_type = connection_type;
+        self
+    }
+
+    pub fn namespace<N>(&mut self, namespace: N) -> &mut Self
+    where
+        N: Into<String>,
+    {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    pub fn query<Q>(&mut self, query: Q) -> &mut Self
+    where
+        Q: Into<HashMap<String, String>>,
+    {
+        self.query = query.into();
+        self
+    }
+
+    pub fn listeners(
+        &mut self,
+        listeners: HashMap<String, Vec<Box<SocketListenerFn>>>,
+    ) -> &mut Self {
+        self.listeners = listeners;
+        self
+    }
+
+    pub fn raw_query<Q>(&mut self, query: Q) -> &mut Self
+    where
+        Q: Into<String>,
+    {
+        self.query.clear();
+        self.transform_raw_query(query);
+        self
+    }
+
+    pub fn force_handshake(&mut self, force: bool) -> &mut Self {
+        self.force_handshake = force;
+        self
+    }
+
+    pub fn enable_reconnect(&mut self, enable: bool) -> &mut Self {
+        self.enable_reconnect = enable;
+        self
+    }
+
+    pub fn max_reconnect_count(&mut self, count: u8) -> &mut Self {
+        self.max_reconnect_count = Some(count);
         self
     }
 }
@@ -94,6 +157,8 @@ impl SocketBuilder {
             force_handshake: false,
             query: HashMap::new(),
             listeners: HashMap::new(),
+            enable_reconnect: true,
+            max_reconnect_count: None,
             #[cfg(feature = "proxy")]
             proxy: None,
             #[cfg(feature = "proxy")]
@@ -175,54 +240,6 @@ impl SocketBuilder {
         self
     }
 
-    pub fn protocol(&mut self, protocol: ProtocolVersion) -> &mut Self {
-        self.protocol = protocol;
-        self
-    }
-
-    pub fn connection_type(&mut self, connection_type: ConnectionType) -> &mut Self {
-        self.connection_type = connection_type;
-        self
-    }
-
-    pub fn namespace<N>(&mut self, namespace: N) -> &mut Self
-    where
-        N: Into<String>,
-    {
-        self.namespace = Some(namespace.into());
-        self
-    }
-
-    pub fn query<Q>(&mut self, query: Q) -> &mut Self
-    where
-        Q: Into<HashMap<String, String>>,
-    {
-        self.query = query.into();
-        self
-    }
-
-    pub fn listeners(
-        &mut self,
-        listeners: HashMap<String, Vec<Box<SocketListenerFn>>>,
-    ) -> &mut Self {
-        self.listeners = listeners;
-        self
-    }
-
-    pub fn raw_query<Q>(&mut self, query: Q) -> &mut Self
-    where
-        Q: Into<String>,
-    {
-        self.query.clear();
-        self.transform_raw_query(query);
-        self
-    }
-
-    pub fn force_handshake(&mut self, force: bool) -> &mut Self {
-        self.force_handshake = force;
-        self
-    }
-
     pub fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
     where
         E: Into<&'e str>,
@@ -294,7 +311,9 @@ impl SocketBuilder {
         )
     }
 
-    pub async fn connect(self) -> Result<Socket, Box<dyn std::error::Error>> {
+    async fn inner_connect(
+        &self,
+    ) -> Result<(SocketReadStream, SocketWriteSink), Box<dyn std::error::Error>> {
         #[cfg(feature = "proxy")]
         let stream = self
             .establish_tunnel(self.request.uri().to_string().as_str())
@@ -315,11 +334,31 @@ impl SocketBuilder {
         #[cfg(not(feature = "proxy"))]
         let stream = TcpStream::connect(Self::get_tcp_connect_str(&self.request).as_str()).await?;
 
-        let ws = fastwebsockets::handshake::client(&SpawnExecutor, self.request, stream)
+        let ws = fastwebsockets::handshake::client(&SpawnExecutor, self.request.clone(), stream)
             .await?
             .0;
 
         let (read, write) = ws.split(|s| tokio::io::split(s));
+
+        Ok((read, write))
+    }
+
+    pub async fn connect(self) -> Result<Socket, Box<dyn std::error::Error>> {
+        let (read, write) = self.inner_connect().await?;
+
+        let reconnect_config = ReconnectConfiguration {
+            enable_reconnect: true,
+            request: self.request,
+            reconnect_count: None,
+            reconnect_delay: 2_500,
+            force_handshake: self.force_handshake,
+            #[cfg(feature = "proxy")]
+            ignore_invalid_proxy: self.ignore_invalid_proxy,
+            #[cfg(feature = "proxy")]
+            ignore_proxy_env_vars: self.ignore_proxy_env_vars,
+            #[cfg(feature = "proxy")]
+            proxy: self.proxy,
+        };
 
         let mut socket = Socket::new(
             read,
@@ -328,11 +367,31 @@ impl SocketBuilder {
             self.wildcard_listener,
         );
 
+        socket.reconnect_configuration(reconnect_config);
+
         if self.force_handshake {
             socket.handshake().await?;
             socket.start_ping_worker().await;
         }
 
         Ok(socket)
+    }
+
+    pub async fn connect_with_reconnect_config<'c>(
+        config: &'c ReconnectConfiguration,
+    ) -> Result<(SocketReadStream, SocketWriteSink), Box<dyn std::error::Error>> {
+        #[allow(unused_mut)]
+        let mut builder = SocketBuilder::new_with_request(config.request.clone());
+
+        #[cfg(feature = "proxy")]
+        builder
+            .ignore_invalid_proxy(config.ignore_invalid_proxy)
+            .ignore_proxy_env_vars(config.ignore_proxy_env_vars)
+            .force_handshake(config.force_handshake)
+            .proxy(config.proxy.clone().unwrap_or(String::new()));
+
+        let (read, write) = builder.inner_connect().await?;
+
+        Ok((read, write))
     }
 }

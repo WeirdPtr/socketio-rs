@@ -1,5 +1,9 @@
-use self::builder::SocketListenerFn;
-use crate::{enums::packet::PacketType, parser::Packet, structs::handshake::Handshake};
+use self::builder::{SocketBuilder, SocketListenerFn};
+use crate::{
+    enums::packet::PacketType,
+    parser::Packet,
+    structs::{handshake::Handshake, reconnect::ReconnectConfiguration},
+};
 use fastwebsockets::{Frame, OpCode, Payload, WebSocketError, WebSocketRead, WebSocketWrite};
 use futures_util::{
     future::{abortable, BoxFuture},
@@ -30,6 +34,7 @@ pub struct Socket {
         tokio::task::JoinHandle<Result<(), futures_util::stream::Aborted>>,
         futures_util::stream::AbortHandle,
     )>,
+    reconnect_configuration: Option<ReconnectConfiguration>,
 }
 
 impl Socket {
@@ -47,10 +52,13 @@ impl Socket {
             handshake_response: None,
             worker_handles: None,
             ping_worker_handles: None,
+            reconnect_configuration: None,
         }
     }
 
     pub async fn run(&mut self) {
+        let _ = self.stop_workers().await;
+
         let worker_read = self.read();
 
         let wildcard_listener = self.wildcard_listener.clone();
@@ -77,7 +85,6 @@ impl Socket {
                     Ok(frame) => frame,
                     Err(e) => match e {
                         WebSocketError::IoError(e) => {
-
                             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                 Self::emit_raw(
                                     "close",
@@ -458,7 +465,7 @@ impl Socket {
         }
     }
 
-    pub async fn stop_workers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn stop_ping_worker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some((_, abort_handle)) = self.ping_worker_handles.take() {
             abort_handle.abort();
             tokio::spawn(Self::emit_raw(
@@ -476,6 +483,10 @@ impl Socket {
             ));
         }
 
+        Ok(())
+    }
+
+    pub async fn stop_listener_worker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some((_, abort_handle)) = self.worker_handles.take() {
             abort_handle.abort();
             tokio::spawn(Self::emit_raw(
@@ -492,6 +503,89 @@ impl Socket {
                 self.write(),
             ));
         }
+
+        Ok(())
+    }
+
+    pub async fn stop_workers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop_ping_worker().await?;
+        self.stop_listener_worker().await?;
+        Ok(())
+    }
+
+    pub fn reconnect_configuration(&mut self, configuration: ReconnectConfiguration) -> &mut Self {
+        self.reconnect_configuration = Some(configuration);
+        self
+    }
+
+    pub async fn reconnect(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.reconnect_configuration.is_none() {
+            return Err("Reconnect configuration is not set".into());
+        }
+
+        let configuration = self.reconnect_configuration.clone().unwrap();
+
+        if !configuration.enable_reconnect {
+            return Err("Reconnect is disabled".into());
+        }
+
+        self.stop_listener_worker().await?;
+
+        let mut read_guard = self.read.lock().await;
+        let mut write_guard = self.write.lock().await;
+
+        let mut reconnect_count = 0;
+
+        loop {
+            if configuration.reconnect_count.is_some() {
+                if reconnect_count >= configuration.reconnect_count.unwrap() {
+                    break;
+                }
+
+                if reconnect_count > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        configuration.reconnect_delay,
+                    ))
+                    .await;
+                }
+            }
+
+            reconnect_count += 1;
+
+            let response = SocketBuilder::connect_with_reconnect_config(&configuration).await;
+
+            if response.is_err() {
+                continue;
+            }
+
+            let (read, write) = response.unwrap();
+
+            drop(std::mem::replace(&mut *read_guard, read));
+            drop(std::mem::replace(&mut *write_guard, write));
+
+            break;
+        }
+
+        drop(read_guard);
+        drop(write_guard);
+
+        if configuration.force_handshake {
+            self.stop_ping_worker().await?;
+            self.handshake().await?;
+            self.start_ping_worker().await;
+        }
+
+        self.run().await;
+
+        Self::emit_raw(
+            "reconnect",
+            self.listeners.clone(),
+            self.wildcard_listener.clone(),
+            Packet::new(PacketType::Event, None, None, None),
+            self.read(),
+            self.write(),
+        )
+        .await;
 
         Ok(())
     }
