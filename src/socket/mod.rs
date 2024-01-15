@@ -1,36 +1,35 @@
 use self::builder::SocketListenerFn;
 use crate::{enums::packet::PacketType, parser::Packet, structs::handshake::Handshake};
+use fastwebsockets::{Frame, OpCode, Payload, WebSocketError, WebSocketRead, WebSocketWrite};
 use futures_util::{
-    future::BoxFuture,
+    future::{abortable, BoxFuture},
     lock::Mutex,
-    stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
+    FutureExt,
 };
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use std::{collections::HashMap, sync::Arc, thread};
-use tokio::{join, net::TcpStream};
-#[cfg(not(feature = "proxy"))]
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tokio::io::{ReadHalf, WriteHalf};
 
 pub mod builder;
 
-#[cfg(not(feature = "proxy"))]
-pub type SocketWriteSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-#[cfg(not(feature = "proxy"))]
-pub type SocketReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
-
-#[cfg(feature = "proxy")]
-pub type SocketWriteSink = SplitSink<WebSocketStream<TcpStream>, Message>;
-#[cfg(feature = "proxy")]
-pub type SocketReadStream = SplitStream<WebSocketStream<TcpStream>>;
+pub type SocketReadStream = WebSocketRead<ReadHalf<TokioIo<Upgraded>>>;
+pub type SocketWriteSink = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
 
 pub struct Socket {
     read: Arc<Mutex<SocketReadStream>>,
     write: Arc<Mutex<SocketWriteSink>>,
     listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
     wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
-    /// Ping interval in ms
-    ping_interval: u32,
+    handshake_response: Option<Handshake>,
+    worker_handles: Option<(
+        tokio::task::JoinHandle<Result<(), futures_util::stream::Aborted>>,
+        futures_util::stream::AbortHandle,
+    )>,
+    ping_worker_handles: Option<(
+        tokio::task::JoinHandle<Result<(), futures_util::stream::Aborted>>,
+        futures_util::stream::AbortHandle,
+    )>,
 }
 
 impl Socket {
@@ -39,104 +38,95 @@ impl Socket {
         write: SocketWriteSink,
         listeners: Option<Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>>,
         wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
-        ping_interval: Option<u32>,
     ) -> Self {
         Self {
             read: Arc::new(Mutex::new(read)),
             write: Arc::new(Mutex::new(write)),
             listeners: listeners.unwrap_or(Arc::new(Mutex::new(HashMap::new()))),
             wildcard_listener,
-            ping_interval: ping_interval.unwrap_or(25_000),
+            handshake_response: None,
+            worker_handles: None,
+            ping_worker_handles: None,
         }
     }
 
-    pub async fn run(
-        &mut self,
-    ) -> (
-        Result<(), tokio::task::JoinError>,
-        Result<(), tokio::task::JoinError>,
-    ) {
-        let ping_write = self.write.clone();
-
-        let ping_listeners = self.listeners.clone();
-
-        let ping_interval = self.ping_interval;
-
-        let ping_read_guard = self.read();
-        let ping_write_guard = self.write();
-
-        let ping_handle = tokio::spawn(async move {
-            let ping_interval =
-                std::time::Duration::from_millis(ping_interval.try_into().unwrap_or(25_000));
-
-            loop {
-                thread::sleep(ping_interval);
-
-                let listeners = ping_listeners.lock().await;
-
-                listeners
-                    .get("ping")
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .for_each(|listener| {
-                        tokio::spawn(listener(
-                            Packet::new(PacketType::Ping, None, None, None),
-                            ping_read_guard.clone(),
-                            ping_write_guard.clone(),
-                        ));
-                    });
-
-                let ping_result = Self::inner_ping(ping_write.clone()).await;
-
-                if ping_result.is_err() {
-                    continue;
-                }
-
-                listeners
-                    .get("pong")
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .for_each(|listener| {
-                        tokio::spawn(listener(
-                            Packet::new(PacketType::Ping, None, None, None),
-                            ping_read_guard.clone(),
-                            ping_write_guard.clone(),
-                        ));
-                    });
-            }
-        });
-
+    pub async fn run(&mut self) {
         let worker_read = self.read();
 
-        let wildcard_listener = self
-            .wildcard_listener
-            .as_ref()
-            .unwrap_or(&Arc::new(Box::new(|_, _, _| Box::pin(async {}))))
-            .clone();
+        let wildcard_listener = self.wildcard_listener.clone();
 
         let listener_guard = self.listeners.clone();
 
         let worker_read_guard = self.read();
         let worker_write_guard = self.write();
 
-        let worker_handle = tokio::spawn(async move {
+        let (task, handle) = abortable(async move {
             loop {
-                let msg = worker_read.lock().await.next().await;
+                let mut frame = worker_read.lock().await;
 
-                if msg.is_none() {
-                    continue;
-                }
+                let frame = frame
+                    .read_frame::<_, WebSocketError>(&mut move |_| async {
+                        Err(WebSocketError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Listener failed",
+                        )))
+                    })
+                    .await;
 
-                let msg = msg.unwrap();
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(e) => match e {
+                        WebSocketError::IoError(e) => {
 
-                if msg.is_err() {
-                    continue;
-                }
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                Self::emit_raw(
+                                    "close",
+                                    listener_guard.clone(),
+                                    wildcard_listener.clone(),
+                                    Packet::new(PacketType::Event, None, None, None),
+                                    worker_read_guard.clone(),
+                                    worker_write_guard.clone(),
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                        WebSocketError::UnexpectedEOF => {
+                            Self::emit_raw(
+                                "close",
+                                listener_guard.clone(),
+                                wildcard_listener.clone(),
+                                Packet::new(PacketType::Event, None, None, None),
+                                worker_read_guard.clone(),
+                                worker_write_guard.clone(),
+                            )
+                            .await;
+                            break;
+                        }
+                        _ => {
+                            Self::emit_raw(
+                                "close",
+                                listener_guard.clone(),
+                                wildcard_listener.clone(),
+                                Packet::new(PacketType::Event, None, None, None),
+                                worker_read_guard.clone(),
+                                worker_write_guard.clone(),
+                            )
+                            .await;
+                            break;
+                        }
+                    },
+                };
 
-                let msg = msg.unwrap();
+                match frame.opcode {
+                    OpCode::Text | OpCode::Binary => {
+                        let text = String::from_utf8(frame.payload.to_vec());
 
-                match msg {
-                    Message::Text(text) => {
+                        let text = match text {
+                            Ok(text) => text,
+                            Err(_) => continue,
+                        };
+
                         let listener_guard = listener_guard.lock().await;
 
                         let packet = Packet::decode(text);
@@ -145,12 +135,11 @@ impl Socket {
                             continue;
                         }
 
-                        let packet = packet.unwrap();
+                        let packet = Arc::new(packet.unwrap());
 
-                        if let Some(target) = &packet.target {
-                            if let Some(listeners) = listener_guard.get(target) {
+                        if packet.packet_type == PacketType::Connect {
+                            if let Some(listeners) = listener_guard.get("handshake") {
                                 listeners.iter().for_each(|listener| {
-                                    // TODO: get rid of clone
                                     tokio::spawn(listener(
                                         packet.clone(),
                                         worker_read_guard.clone(),
@@ -160,31 +149,95 @@ impl Socket {
                             }
                         }
 
-                        tokio::spawn(wildcard_listener(
-                            packet,
-                            worker_read_guard.clone(),
-                            worker_write_guard.clone(),
-                        ));
-                    }
-                    Message::Close(_) => listener_guard
-                        .lock()
-                        .await
-                        .get("close")
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .for_each(|listener| {
-                            tokio::spawn(listener(
-                                Packet::new(PacketType::Event, None, None, None),
+                        if let Some(target) = &packet.target {
+                            if let Some(listeners) = listener_guard.get(target) {
+                                listeners.iter().for_each(|listener| {
+                                    tokio::spawn(listener(
+                                        packet.clone(),
+                                        worker_read_guard.clone(),
+                                        worker_write_guard.clone(),
+                                    ));
+                                });
+                            }
+                        }
+
+                        if let Some(wildcard_listener) = wildcard_listener.clone() {
+                            tokio::spawn(wildcard_listener(
+                                packet.clone(),
                                 worker_read_guard.clone(),
                                 worker_write_guard.clone(),
                             ));
-                        }),
+                        }
+                    }
+                    OpCode::Close => {
+                        tokio::spawn(Self::emit_raw(
+                            "close",
+                            listener_guard.clone(),
+                            wildcard_listener.clone(),
+                            Packet::new(PacketType::Event, None, None, None),
+                            worker_read_guard.clone(),
+                            worker_write_guard.clone(),
+                        ));
+                        break;
+                    }
                     _ => { /* Ignore */ }
                 }
             }
         });
 
-        join!(ping_handle, worker_handle)
+        let worker_handle = tokio::spawn(task);
+
+        self.worker_handles = Some((worker_handle, handle));
+    }
+
+    async fn start_ping_worker(&mut self) {
+        let ping_write = self.write.clone();
+
+        let ping_read_guard = self.read();
+        let ping_write_guard = self.write();
+        let ping_listeners = self.listeners.clone();
+        let ping_wildcard_listener = self.wildcard_listener.clone();
+
+        let ping_interval = match self.handshake_response.as_ref() {
+            Some(handshake_response) => handshake_response.ping_interval,
+            None => 25_000,
+        };
+
+        let (task, handle) = abortable(async move {
+            let ping_interval = std::time::Duration::from_millis(ping_interval);
+
+            loop {
+                tokio::spawn(Self::emit_raw(
+                    "ping",
+                    ping_listeners.clone(),
+                    ping_wildcard_listener.clone(),
+                    Packet::new(PacketType::Ping, None, None, None),
+                    ping_read_guard.clone(),
+                    ping_write_guard.clone(),
+                ));
+
+                let ping_result = Self::inner_ping(ping_write.clone()).await;
+
+                if ping_result.is_err() {
+                    continue;
+                }
+
+                tokio::spawn(Self::emit_raw(
+                    "pong",
+                    ping_listeners.clone(),
+                    ping_wildcard_listener.clone(),
+                    Packet::new(PacketType::Ping, None, None, None),
+                    ping_read_guard.clone(),
+                    ping_write_guard.clone(),
+                ));
+
+                thread::sleep(ping_interval);
+            }
+        });
+
+        let ping_handle = tokio::spawn(task);
+
+        self.ping_worker_handles = Some((ping_handle, handle));
     }
 
     pub fn run_background(mut self) {
@@ -218,17 +271,16 @@ impl Socket {
         self
     }
 
-    async fn inner_ping(
-        write: Arc<Mutex<SocketWriteSink>>,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        Self::send_raw(write, PacketType::Ping.into()).await
+    async fn inner_ping(write: Arc<Mutex<SocketWriteSink>>) -> Result<(), WebSocketError> {
+        let ping_payload: &str = PacketType::Ping.into();
+        Self::send_raw(write, Payload::Borrowed(ping_payload.as_bytes())).await
     }
 
     pub async fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
     where
         E: Into<&'e str>,
         L: for<'a> Fn(
-                Packet,
+                Arc<Packet>,
                 Arc<Mutex<SocketReadStream>>,
                 Arc<Mutex<SocketWriteSink>>,
             ) -> BoxFuture<'static, ()>
@@ -244,26 +296,29 @@ impl Socket {
         let listeners = self.listeners.lock().await;
         let listeners = listeners.get(&event);
 
+        let packet = Arc::new(data);
+
         if listeners.is_some() {
             let listeners = listeners.unwrap();
 
             listeners.iter().for_each(|listener| {
-                tokio::spawn(listener(data.clone(), self.read(), self.write()));
+                tokio::spawn(listener(packet.clone(), self.read(), self.write()));
             });
         }
 
         if self.wildcard_listener.is_some() {
-            let listener =
-                self.wildcard_listener.as_ref().unwrap()(data, self.read(), self.write());
-
-            tokio::spawn(listener);
+            tokio::spawn(self.wildcard_listener.as_ref().unwrap()(
+                packet,
+                self.read(),
+                self.write(),
+            ));
         }
     }
 
     pub fn on_any<L>(&mut self, listener: L) -> &mut Self
     where
         L: for<'a> Fn(
-                Packet,
+                Arc<Packet>,
                 Arc<Mutex<SocketReadStream>>,
                 Arc<Mutex<SocketWriteSink>>,
             ) -> BoxFuture<'static, ()>
@@ -283,7 +338,7 @@ impl Socket {
         self.write.clone()
     }
 
-    pub async fn ping(&self) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    pub async fn ping(&self) -> Result<(), WebSocketError> {
         Self::inner_ping(self.write.clone()).await
     }
 
@@ -292,7 +347,7 @@ impl Socket {
             sid: None,
             upgrades: vec!["websocket".to_string()],
             ping_timeout: 20000,
-            ping_interval: self.ping_interval,
+            ping_interval: 25000,
         };
 
         let handshake_packet = Packet::new_raw(
@@ -304,15 +359,41 @@ impl Socket {
 
         Self::send_raw_packet(self.write(), handshake_packet).await?;
 
-        let handshake_response = self.read.lock().await.next().await;
+        let mut handshake_response_frame = self.read.lock().await;
 
-        if handshake_response.is_some() {
-            let response = handshake_response.unwrap().unwrap().to_string();
+        let handshake_response_frame = handshake_response_frame
+            .read_frame::<_, WebSocketError>(&mut |_| {
+                async {
+                    Err(WebSocketError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Handshake failed",
+                    )))
+                }
+                .boxed()
+            })
+            .await?;
 
-            let packet = Packet::decode(response.as_bytes().to_vec())?;
+        let handshake_response_packet = match handshake_response_frame.opcode {
+            OpCode::Text | OpCode::Binary => {
+                Packet::decode(handshake_response_frame.payload.to_vec()).ok()
+            }
+            _ => None,
+        };
 
-            self.emit("handshake".to_owned(), packet).await;
+        if handshake_response_packet.is_none() {
+            return Ok(());
         }
+
+        let handshake_response_packet = handshake_response_packet.unwrap();
+
+        if let Some(handshake_data) = handshake_response_packet.data.clone() {
+            let handshake_data: Handshake = serde_json::from_value(handshake_data)?;
+
+            self.handshake_response = Some(handshake_data);
+        }
+
+        self.emit("handshake".to_owned(), handshake_response_packet)
+            .await;
 
         Ok(())
     }
@@ -330,30 +411,88 @@ impl Socket {
         Ok(())
     }
 
-    pub async fn send_raw_with_type(
-        write: Arc<Mutex<SocketWriteSink>>,
-        payload: Message,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        write.lock().await.send(payload).await.map_err(|e| e.into())
-    }
-
     pub async fn send_raw(
         write: Arc<Mutex<SocketWriteSink>>,
-        payload: String,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        Self::send_raw_with_type(write, Message::Text(payload)).await
+        payload: impl Into<Payload<'_>>,
+    ) -> Result<(), WebSocketError> {
+        write
+            .lock()
+            .await
+            .write_frame(Frame::text(payload.into()))
+            .await
     }
 
     pub async fn send_raw_packet(
         write: Arc<Mutex<SocketWriteSink>>,
         payload: Packet,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        Self::send_raw(write, Packet::encode(payload)).await
+    ) -> Result<(), WebSocketError> {
+        Self::send_raw(write, Payload::Borrowed(Packet::encode(payload).as_bytes())).await
     }
 
-    pub async fn send_packet(&self, packet: Packet) -> Result<(), Box<dyn std::error::Error>> {
-        Self::send_raw_packet(self.write(), packet)
+    pub async fn send_packet(&self, packet: Packet) -> Result<(), WebSocketError> {
+        Self::send_raw_packet(self.write(), packet).await
+    }
+
+    pub async fn emit_raw<'a>(
+        event_identifier: impl Into<&'a str>,
+        listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
+        wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
+        packet: impl Into<Arc<Packet>>,
+        read: Arc<Mutex<WebSocketRead<ReadHalf<TokioIo<Upgraded>>>>>,
+        write: Arc<Mutex<WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>>>,
+    ) {
+        let packet = packet.into();
+
+        listeners
+            .lock()
             .await
-            .map_err(|e| e.into())
+            .get(event_identifier.into())
+            .unwrap_or(&vec![])
+            .iter()
+            .for_each(|listener| {
+                tokio::spawn(listener(packet.clone(), read.clone(), write.clone()));
+            });
+
+        if let Some(wildcard_listener) = wildcard_listener {
+            tokio::spawn(wildcard_listener(packet, read, write));
+        }
+    }
+
+    pub async fn stop_workers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some((_, abort_handle)) = self.ping_worker_handles.take() {
+            abort_handle.abort();
+            tokio::spawn(Self::emit_raw(
+                "worker:stopped",
+                self.listeners.clone(),
+                self.wildcard_listener.clone(),
+                Packet::new(
+                    PacketType::Event,
+                    None,
+                    None,
+                    Some(serde_json::Value::String("ping".to_owned())),
+                ),
+                self.read(),
+                self.write(),
+            ));
+        }
+
+        if let Some((_, abort_handle)) = self.worker_handles.take() {
+            abort_handle.abort();
+            tokio::spawn(Self::emit_raw(
+                "worker:stopped",
+                self.listeners.clone(),
+                self.wildcard_listener.clone(),
+                Packet::new(
+                    PacketType::Event,
+                    None,
+                    None,
+                    Some(serde_json::Value::String("listener".to_owned())),
+                ),
+                self.read(),
+                self.write(),
+            ));
+        }
+
+        Ok(())
     }
 }
