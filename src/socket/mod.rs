@@ -51,6 +51,8 @@ impl Socket {
     }
 
     pub async fn run(&mut self) {
+        let _ = self.stop_workers().await;
+
         let worker_read = self.read();
 
         let wildcard_listener = self.wildcard_listener.clone();
@@ -77,7 +79,6 @@ impl Socket {
                     Ok(frame) => frame,
                     Err(e) => match e {
                         WebSocketError::IoError(e) => {
-
                             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                 Self::emit_raw(
                                     "close",
