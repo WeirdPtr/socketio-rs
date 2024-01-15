@@ -4,8 +4,10 @@ pub mod socket;
 pub mod structs;
 pub mod util;
 
-/// Re-export of `tokio_tungstenite::tungstenite::http::Request`
-pub type Request<T> = tokio_tungstenite::tungstenite::http::Request<T>;
+/// Re-export of `hyper::Request`
+pub type Request<T> = hyper::Request<T>;
 
-/// Re-export of `tokio_tungstenite::tungstenite::Message`
-pub type Message = tokio_tungstenite::tungstenite::Message;
+/// Re-export
+pub fn get_empty_body() -> http_body_util::Empty<bytes::Bytes> {
+    http_body_util::Empty::new()
+}
