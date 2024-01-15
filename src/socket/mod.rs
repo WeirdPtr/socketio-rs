@@ -77,7 +77,6 @@ impl Socket {
                     Ok(frame) => frame,
                     Err(e) => match e {
                         WebSocketError::IoError(e) => {
-                            println!("IoError: {e}");
 
                             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                 Self::emit_raw(
@@ -93,8 +92,6 @@ impl Socket {
                             break;
                         }
                         WebSocketError::UnexpectedEOF => {
-                            println!("UnexpectedEOF");
-
                             Self::emit_raw(
                                 "close",
                                 listener_guard.clone(),

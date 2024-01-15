@@ -269,9 +269,6 @@ impl SocketBuilder {
             ));
         }
 
-        println!("Proxy: {}", proxy_str);
-        println!("URI: {}", uri);
-
         let stream = TcpProxy::from_proxy_str(proxy_str.as_str())?
             .connect(uri)
             .await;
