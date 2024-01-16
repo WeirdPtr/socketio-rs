@@ -528,6 +528,10 @@ impl Socket {
         self
     }
 
+    pub fn get_reconnect_configuration(&self) -> Option<&ReconnectConfiguration> {
+        self.reconnect_configuration.as_ref()
+    }
+
     pub async fn reconnect(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.reconnect_configuration.is_none() {
             return Err("Reconnect configuration is not set".into());
@@ -541,8 +545,52 @@ impl Socket {
 
         self.stop_listener_worker().await?;
 
-        let mut read_guard = self.read.lock().await;
-        let mut write_guard = self.write.lock().await;
+        Self::reconnect_raw(self.read.clone(), self.write.clone(), configuration.clone()).await?;
+
+        if configuration.force_handshake {
+            self.stop_ping_worker().await?;
+            self.handshake().await?;
+            self.start_ping_worker().await;
+        }
+
+        self.run().await;
+
+        Self::emit_raw(
+            "reconnect",
+            self.listeners.clone(),
+            self.wildcard_listener.clone(),
+            Packet::new(PacketType::Event, None, None, None),
+            self.read(),
+            self.write(),
+        )
+        .await;
+
+        Self::emit_raw(
+            "reconnect",
+            self.listeners.clone(),
+            self.wildcard_listener.clone(),
+            Packet::new(PacketType::Event, None, None, None),
+            self.read(),
+            self.write(),
+        )
+        .await;
+
+        Ok(())
+    }
+
+    /// Reconnects the socket with the given configuration <br>
+    /// <b>DOES NOT EMIT THE `reconnect` EVENT</b>
+    pub async fn reconnect_raw(
+        read: Arc<Mutex<SocketReadStream>>,
+        write: Arc<Mutex<SocketWriteSink>>,
+        configuration: ReconnectConfiguration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !configuration.enable_reconnect {
+            return Err("Reconnect is disabled".into());
+        }
+
+        let mut read_guard = read.lock().await;
+        let mut write_guard = write.lock().await;
 
         let mut reconnect_count = 0;
 
@@ -578,24 +626,6 @@ impl Socket {
 
         drop(read_guard);
         drop(write_guard);
-
-        if configuration.force_handshake {
-            self.stop_ping_worker().await?;
-            self.handshake().await?;
-            self.start_ping_worker().await;
-        }
-
-        self.run().await;
-
-        Self::emit_raw(
-            "reconnect",
-            self.listeners.clone(),
-            self.wildcard_listener.clone(),
-            Packet::new(PacketType::Event, None, None, None),
-            self.read(),
-            self.write(),
-        )
-        .await;
 
         Ok(())
     }
