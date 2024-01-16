@@ -4,7 +4,7 @@ use crate::{
     parser::Packet,
     structs::{handshake::Handshake, reconnect::ReconnectConfiguration},
 };
-use fastwebsockets::{Frame, OpCode, Payload, WebSocketError, WebSocketRead, WebSocketWrite};
+use fastwebsockets::{Frame, OpCode, WebSocketError, WebSocketRead, WebSocketWrite};
 use futures_util::{
     future::{abortable, BoxFuture},
     lock::Mutex,
@@ -19,6 +19,9 @@ pub mod builder;
 
 pub type SocketReadStream = WebSocketRead<ReadHalf<TokioIo<Upgraded>>>;
 pub type SocketWriteSink = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
+
+/// Re-export of `fastwebsockets::Payload`
+pub type SocketPayload<'a> = fastwebsockets::Payload<'a>;
 
 pub struct Socket {
     read: Arc<Mutex<SocketReadStream>>,
@@ -280,7 +283,7 @@ impl Socket {
 
     async fn inner_ping(write: Arc<Mutex<SocketWriteSink>>) -> Result<(), WebSocketError> {
         let ping_payload: &str = PacketType::Ping.into();
-        Self::send_raw(write, Payload::Borrowed(ping_payload.as_bytes())).await
+        Self::send_raw(write, SocketPayload::Borrowed(ping_payload.as_bytes())).await
     }
 
     pub async fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
@@ -420,7 +423,7 @@ impl Socket {
 
     pub async fn send_raw(
         write: Arc<Mutex<SocketWriteSink>>,
-        payload: impl Into<Payload<'_>>,
+        payload: impl Into<SocketPayload<'_>>,
     ) -> Result<(), WebSocketError> {
         write
             .lock()
@@ -433,7 +436,11 @@ impl Socket {
         write: Arc<Mutex<SocketWriteSink>>,
         payload: Packet,
     ) -> Result<(), WebSocketError> {
-        Self::send_raw(write, Payload::Borrowed(Packet::encode(payload).as_bytes())).await
+        Self::send_raw(
+            write,
+            SocketPayload::Borrowed(Packet::encode(payload).as_bytes()),
+        )
+        .await
     }
 
     pub async fn send_packet(&self, packet: Packet) -> Result<(), WebSocketError> {
