@@ -283,7 +283,7 @@ impl Socket {
 
     async fn inner_ping(write: Arc<Mutex<SocketWriteSink>>) -> Result<(), WebSocketError> {
         let ping_payload: &str = PacketType::Ping.into();
-        Self::send_raw(write, SocketPayload::Borrowed(ping_payload.as_bytes())).await
+        Self::send_raw(write, ping_payload.as_bytes()).await
     }
 
     pub async fn on<'e, E, L>(&mut self, event: E, listener: L) -> &mut Self
@@ -421,7 +421,7 @@ impl Socket {
         Ok(())
     }
 
-    pub async fn send_raw(
+    pub async fn send_raw_payload(
         write: Arc<Mutex<SocketWriteSink>>,
         payload: impl Into<SocketPayload<'_>>,
     ) -> Result<(), WebSocketError> {
@@ -432,15 +432,18 @@ impl Socket {
             .await
     }
 
+    pub async fn send_raw<'p>(
+        write: Arc<Mutex<SocketWriteSink>>,
+        payload: impl Into<&'p [u8]>,
+    ) -> Result<(), WebSocketError> {
+        Self::send_raw_payload(write, SocketPayload::Borrowed(payload.into())).await
+    }
+
     pub async fn send_raw_packet(
         write: Arc<Mutex<SocketWriteSink>>,
         payload: Packet,
     ) -> Result<(), WebSocketError> {
-        Self::send_raw(
-            write,
-            SocketPayload::Borrowed(Packet::encode(payload).as_bytes()),
-        )
-        .await
+        Self::send_raw(write, Packet::encode(payload).as_bytes()).await
     }
 
     pub async fn send_packet(&self, packet: Packet) -> Result<(), WebSocketError> {
