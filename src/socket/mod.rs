@@ -60,7 +60,7 @@ impl Socket {
     }
 
     pub async fn run(&mut self) {
-        let _ = self.stop_workers().await;
+        // let _ = self.stop_workers().await;
 
         let worker_read = self.read();
 
