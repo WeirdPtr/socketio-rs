@@ -1,7 +1,7 @@
 #[derive(Clone)]
 pub struct ReconnectConfiguration {
     pub enable_reconnect: bool,
-    pub reconnect_count: Option<u8>,
+    pub reconnect_count: Option<u64>,
     pub reconnect_delay: u64,
     pub request: hyper::Request<http_body_util::Empty<bytes::Bytes>>,
     pub force_handshake: bool,

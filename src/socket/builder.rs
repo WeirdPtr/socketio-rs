@@ -383,12 +383,17 @@ impl SocketBuilder {
         #[allow(unused_mut)]
         let mut builder = SocketBuilder::new_with_request(config.request.clone());
 
+        builder.force_handshake(config.force_handshake);
+
         #[cfg(feature = "proxy")]
         builder
             .ignore_invalid_proxy(config.ignore_invalid_proxy)
-            .ignore_proxy_env_vars(config.ignore_proxy_env_vars)
-            .force_handshake(config.force_handshake)
-            .proxy(config.proxy.clone().unwrap_or(String::new()));
+            .ignore_proxy_env_vars(config.ignore_proxy_env_vars);
+
+        #[cfg(feature = "proxy")]
+        if let Some(proxy) = config.proxy.clone() {
+            builder.proxy(proxy);
+        }
 
         let (read, write) = builder.inner_connect().await?;
 
