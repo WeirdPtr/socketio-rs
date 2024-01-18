@@ -63,11 +63,8 @@ impl Socket {
         // let _ = self.stop_workers().await;
 
         let worker_read = self.read();
-
         let wildcard_listener = self.wildcard_listener.clone();
-
         let listener_guard = self.listeners.clone();
-
         let worker_read_guard = self.read();
         let worker_write_guard = self.write();
 
@@ -76,11 +73,32 @@ impl Socket {
                 let mut frame = worker_read.lock().await;
 
                 let frame = frame
-                    .read_frame::<_, WebSocketError>(&mut move |_| async {
-                        Err(WebSocketError::IoError(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Listener failed",
-                        )))
+                    .read_frame::<_, WebSocketError>(&mut |frame| {
+                        let listener_guard = listener_guard.clone();
+                        let wildcard_listener = wildcard_listener.clone();
+                        let worker_read_guard = worker_read_guard.clone();
+                        let worker_write_guard = worker_write_guard.clone();
+
+                        async move {
+                            match frame.opcode {
+                                OpCode::Close => {
+                                    Self::emit_raw(
+                                        "close",
+                                        listener_guard.clone(),
+                                        wildcard_listener.clone(),
+                                        Packet::new(PacketType::Event, None, None, None),
+                                        worker_read_guard.clone(),
+                                        worker_write_guard.clone(),
+                                    )
+                                    .await;
+                                    Ok(())
+                                }
+                                _ => Err(WebSocketError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "Listener failed",
+                                ))),
+                            }
+                        }
                     })
                     .await;
 
@@ -93,7 +111,14 @@ impl Socket {
                                     "close",
                                     listener_guard.clone(),
                                     wildcard_listener.clone(),
-                                    Packet::new(PacketType::Event, None, None, None),
+                                    Packet::new(
+                                        PacketType::Event,
+                                        None,
+                                        None,
+                                        Some(serde_json::Value::String(
+                                            "Unexpected EOF".to_owned(),
+                                        )),
+                                    ),
                                     worker_read_guard.clone(),
                                     worker_write_guard.clone(),
                                 )
@@ -106,19 +131,29 @@ impl Socket {
                                 "close",
                                 listener_guard.clone(),
                                 wildcard_listener.clone(),
-                                Packet::new(PacketType::Event, None, None, None),
+                                Packet::new(
+                                    PacketType::Event,
+                                    None,
+                                    None,
+                                    Some(serde_json::Value::String("Unexpected EOF".to_owned())),
+                                ),
                                 worker_read_guard.clone(),
                                 worker_write_guard.clone(),
                             )
                             .await;
                             break;
                         }
-                        _ => {
+                        err => {
                             Self::emit_raw(
                                 "close",
                                 listener_guard.clone(),
                                 wildcard_listener.clone(),
-                                Packet::new(PacketType::Event, None, None, None),
+                                Packet::new(
+                                    PacketType::Event,
+                                    None,
+                                    None,
+                                    Some(serde_json::Value::String(format!("Unknown: {:?}", err))),
+                                ),
                                 worker_read_guard.clone(),
                                 worker_write_guard.clone(),
                             )
@@ -184,7 +219,12 @@ impl Socket {
                             "close",
                             listener_guard.clone(),
                             wildcard_listener.clone(),
-                            Packet::new(PacketType::Event, None, None, None),
+                            Packet::new(
+                                PacketType::Event,
+                                None,
+                                None,
+                                Some(serde_json::Value::String("Close".to_owned())),
+                            ),
                             worker_read_guard.clone(),
                             worker_write_guard.clone(),
                         ));
@@ -592,7 +632,7 @@ impl Socket {
         let mut read_guard = read.lock().await;
         let mut write_guard = write.lock().await;
 
-        let mut reconnect_count = 0;
+        let mut reconnect_count: u64 = 0;
 
         loop {
             if configuration.reconnect_count.is_some() {
