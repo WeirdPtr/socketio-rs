@@ -1,6 +1,6 @@
 use super::{Socket, SocketReadStream, SocketWriteSink};
 use crate::{
-    enums::{connection::ConnectionType, protocol::ProtocolVersion},
+    enums::{connection::ConnectionType, packet::PacketType, protocol::ProtocolVersion},
     get_empty_body,
     parser::Packet,
     structs::reconnect::ReconnectConfiguration,
@@ -346,6 +346,28 @@ impl SocketBuilder {
     pub async fn connect(self) -> Result<Socket, Box<dyn std::error::Error>> {
         let (read, write) = self.inner_connect().await?;
 
+        let listeners = Arc::new(Mutex::new(self.listeners));
+
+        let packet = Packet::new(
+            PacketType::Event,
+            None,
+            Some("open".to_owned()),
+            Some(serde_json::Value::String("open".to_owned())),
+        );
+
+        let read = Arc::new(Mutex::new(read));
+        let write = Arc::new(Mutex::new(write));
+
+        Socket::emit_raw(
+            "open",
+            listeners.clone(),
+            self.wildcard_listener.clone(),
+            packet,
+            read.clone(),
+            write.clone(),
+        )
+        .await;
+
         let reconnect_config = ReconnectConfiguration {
             enable_reconnect: true,
             request: self.request,
@@ -360,12 +382,7 @@ impl SocketBuilder {
             proxy: self.proxy,
         };
 
-        let mut socket = Socket::new(
-            read,
-            write,
-            Some(Arc::new(Mutex::new(self.listeners))),
-            self.wildcard_listener,
-        );
+        let mut socket = Socket::new(read, write, Some(listeners), self.wildcard_listener);
 
         socket.reconnect_configuration(reconnect_config);
 
