@@ -589,12 +589,12 @@ impl Socket {
         Self::reconnect_raw(self.read.clone(), self.write.clone(), configuration.clone()).await?;
 
         self.emit(
-            "open".to_owned(),
+            "socket:connect".to_owned(),
             Packet::new(
                 PacketType::Event,
                 None,
-                Some("open".to_owned()),
-                Some(serde_json::Value::String("open".to_owned())),
+                Some("socket:connect".to_owned()),
+                Some(serde_json::Value::String("socket:connect".to_owned())),
             ),
         )
         .await;

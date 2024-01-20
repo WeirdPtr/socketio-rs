@@ -351,15 +351,15 @@ impl SocketBuilder {
         let packet = Packet::new(
             PacketType::Event,
             None,
-            Some("open".to_owned()),
-            Some(serde_json::Value::String("open".to_owned())),
+            Some("socket:connect".to_owned()),
+            Some(serde_json::Value::String("socket:connect".to_owned())),
         );
 
         let read = Arc::new(Mutex::new(read));
         let write = Arc::new(Mutex::new(write));
 
         Socket::emit_raw(
-            "open",
+            "socket:connect",
             listeners.clone(),
             self.wildcard_listener.clone(),
             packet,
