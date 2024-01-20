@@ -3,6 +3,7 @@ use crate::{
     enums::packet::PacketType,
     parser::Packet,
     structs::{handshake::Handshake, reconnect::ReconnectConfiguration},
+    util::safe_spawn,
 };
 use fastwebsockets::{Frame, OpCode, WebSocketError, WebSocketRead, WebSocketWrite};
 use futures_util::{
@@ -42,14 +43,14 @@ pub struct Socket {
 
 impl Socket {
     pub fn new(
-        read: SocketReadStream,
-        write: SocketWriteSink,
+        read: impl Into<Arc<Mutex<SocketReadStream>>>,
+        write: impl Into<Arc<Mutex<SocketWriteSink>>>,
         listeners: Option<Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>>,
         wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
     ) -> Self {
         Self {
-            read: Arc::new(Mutex::new(read)),
-            write: Arc::new(Mutex::new(write)),
+            read: read.into(),
+            write: write.into(),
             listeners: listeners.unwrap_or(Arc::new(Mutex::new(HashMap::new()))),
             wildcard_listener,
             handshake_response: None,
@@ -185,7 +186,7 @@ impl Socket {
                         if packet.packet_type == PacketType::Connect {
                             if let Some(listeners) = listener_guard.get("handshake") {
                                 listeners.iter().for_each(|listener| {
-                                    tokio::spawn(listener(
+                                    safe_spawn(listener(
                                         packet.clone(),
                                         worker_read_guard.clone(),
                                         worker_write_guard.clone(),
@@ -197,7 +198,7 @@ impl Socket {
                         if let Some(target) = &packet.target {
                             if let Some(listeners) = listener_guard.get(target) {
                                 listeners.iter().for_each(|listener| {
-                                    tokio::spawn(listener(
+                                    safe_spawn(listener(
                                         packet.clone(),
                                         worker_read_guard.clone(),
                                         worker_write_guard.clone(),
@@ -207,7 +208,7 @@ impl Socket {
                         }
 
                         if let Some(wildcard_listener) = wildcard_listener.clone() {
-                            tokio::spawn(wildcard_listener(
+                            safe_spawn(wildcard_listener(
                                 packet.clone(),
                                 worker_read_guard.clone(),
                                 worker_write_guard.clone(),
@@ -215,7 +216,7 @@ impl Socket {
                         }
                     }
                     OpCode::Close => {
-                        tokio::spawn(Self::emit_raw(
+                        safe_spawn(Self::emit_raw(
                             "close",
                             listener_guard.clone(),
                             wildcard_listener.clone(),
@@ -257,7 +258,7 @@ impl Socket {
             let ping_interval = std::time::Duration::from_millis(ping_interval);
 
             loop {
-                tokio::spawn(Self::emit_raw(
+                safe_spawn(Self::emit_raw(
                     "ping",
                     ping_listeners.clone(),
                     ping_wildcard_listener.clone(),
@@ -272,7 +273,7 @@ impl Socket {
                     continue;
                 }
 
-                tokio::spawn(Self::emit_raw(
+                safe_spawn(Self::emit_raw(
                     "pong",
                     ping_listeners.clone(),
                     ping_wildcard_listener.clone(),
@@ -291,7 +292,7 @@ impl Socket {
     }
 
     pub fn run_background(mut self) {
-        tokio::spawn(async move {
+        safe_spawn(async move {
             let _ = self.run().await;
         });
     }
@@ -352,12 +353,12 @@ impl Socket {
             let listeners = listeners.unwrap();
 
             listeners.iter().for_each(|listener| {
-                tokio::spawn(listener(packet.clone(), self.read(), self.write()));
+                safe_spawn(listener(packet.clone(), self.read(), self.write()));
             });
         }
 
         if self.wildcard_listener.is_some() {
-            tokio::spawn(self.wildcard_listener.as_ref().unwrap()(
+            safe_spawn(self.wildcard_listener.as_ref().unwrap()(
                 packet,
                 self.read(),
                 self.write(),
@@ -507,18 +508,18 @@ impl Socket {
             .unwrap_or(&vec![])
             .iter()
             .for_each(|listener| {
-                tokio::spawn(listener(packet.clone(), read.clone(), write.clone()));
+                safe_spawn(listener(packet.clone(), read.clone(), write.clone()));
             });
 
         if let Some(wildcard_listener) = wildcard_listener {
-            tokio::spawn(wildcard_listener(packet, read, write));
+            safe_spawn(wildcard_listener(packet, read, write));
         }
     }
 
     pub async fn stop_ping_worker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some((_, abort_handle)) = self.ping_worker_handles.take() {
             abort_handle.abort();
-            tokio::spawn(Self::emit_raw(
+            safe_spawn(Self::emit_raw(
                 "worker:stopped",
                 self.listeners.clone(),
                 self.wildcard_listener.clone(),
@@ -539,7 +540,7 @@ impl Socket {
     pub async fn stop_listener_worker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some((_, abort_handle)) = self.worker_handles.take() {
             abort_handle.abort();
-            tokio::spawn(Self::emit_raw(
+            safe_spawn(Self::emit_raw(
                 "worker:stopped",
                 self.listeners.clone(),
                 self.wildcard_listener.clone(),
@@ -586,6 +587,17 @@ impl Socket {
         self.stop_listener_worker().await?;
 
         Self::reconnect_raw(self.read.clone(), self.write.clone(), configuration.clone()).await?;
+
+        self.emit(
+            "socket:connect".to_owned(),
+            Packet::new(
+                PacketType::Event,
+                None,
+                Some("socket:connect".to_owned()),
+                Some(serde_json::Value::String("socket:connect".to_owned())),
+            ),
+        )
+        .await;
 
         if configuration.force_handshake {
             self.stop_ping_worker().await?;
