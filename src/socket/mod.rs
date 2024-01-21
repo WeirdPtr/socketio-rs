@@ -9,6 +9,7 @@ use fastwebsockets::{Frame, OpCode, WebSocketError, WebSocketRead, WebSocketWrit
 use futures_util::{
     future::{abortable, BoxFuture},
     lock::Mutex,
+    stream::AbortHandle,
     FutureExt,
 };
 use hyper::upgrade::Upgraded;
@@ -30,14 +31,8 @@ pub struct Socket {
     listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
     wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
     handshake_response: Option<Handshake>,
-    worker_handles: Option<(
-        tokio::task::JoinHandle<Result<(), futures_util::stream::Aborted>>,
-        futures_util::stream::AbortHandle,
-    )>,
-    ping_worker_handles: Option<(
-        tokio::task::JoinHandle<Result<(), futures_util::stream::Aborted>>,
-        futures_util::stream::AbortHandle,
-    )>,
+    worker_handle: Arc<Mutex<Option<AbortHandle>>>,
+    ping_worker_handle: Arc<Mutex<Option<AbortHandle>>>,
     reconnect_configuration: Option<ReconnectConfiguration>,
 }
 
@@ -54,8 +49,8 @@ impl Socket {
             listeners: listeners.unwrap_or(Arc::new(Mutex::new(HashMap::new()))),
             wildcard_listener,
             handshake_response: None,
-            worker_handles: None,
-            ping_worker_handles: None,
+            worker_handle: Arc::new(Mutex::new(None)),
+            ping_worker_handle: Arc::new(Mutex::new(None)),
             reconnect_configuration: None,
         }
     }
@@ -63,185 +58,21 @@ impl Socket {
     pub async fn run(&mut self) {
         // let _ = self.stop_workers().await;
 
-        let worker_read = self.read();
-        let wildcard_listener = self.wildcard_listener.clone();
-        let listener_guard = self.listeners.clone();
-        let worker_read_guard = self.read();
-        let worker_write_guard = self.write();
-
-        let (task, handle) = abortable(async move {
-            loop {
-                let mut frame = worker_read.lock().await;
-
-                let frame = frame
-                    .read_frame::<_, WebSocketError>(&mut |frame| {
-                        let listener_guard = listener_guard.clone();
-                        let wildcard_listener = wildcard_listener.clone();
-                        let worker_read_guard = worker_read_guard.clone();
-                        let worker_write_guard = worker_write_guard.clone();
-
-                        async move {
-                            match frame.opcode {
-                                OpCode::Close => {
-                                    Self::emit_raw(
-                                        "close",
-                                        listener_guard.clone(),
-                                        wildcard_listener.clone(),
-                                        Packet::new(PacketType::Event, None, None, None),
-                                        worker_read_guard.clone(),
-                                        worker_write_guard.clone(),
-                                    )
-                                    .await;
-                                    Ok(())
-                                }
-                                _ => Err(WebSocketError::IoError(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "Listener failed",
-                                ))),
-                            }
-                        }
-                    })
-                    .await;
-
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(e) => match e {
-                        WebSocketError::IoError(e) => {
-                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                                Self::emit_raw(
-                                    "close",
-                                    listener_guard.clone(),
-                                    wildcard_listener.clone(),
-                                    Packet::new(
-                                        PacketType::Event,
-                                        None,
-                                        None,
-                                        Some(serde_json::Value::String(
-                                            "Unexpected EOF".to_owned(),
-                                        )),
-                                    ),
-                                    worker_read_guard.clone(),
-                                    worker_write_guard.clone(),
-                                )
-                                .await;
-                            }
-                            break;
-                        }
-                        WebSocketError::UnexpectedEOF => {
-                            Self::emit_raw(
-                                "close",
-                                listener_guard.clone(),
-                                wildcard_listener.clone(),
-                                Packet::new(
-                                    PacketType::Event,
-                                    None,
-                                    None,
-                                    Some(serde_json::Value::String("Unexpected EOF".to_owned())),
-                                ),
-                                worker_read_guard.clone(),
-                                worker_write_guard.clone(),
-                            )
-                            .await;
-                            break;
-                        }
-                        err => {
-                            Self::emit_raw(
-                                "close",
-                                listener_guard.clone(),
-                                wildcard_listener.clone(),
-                                Packet::new(
-                                    PacketType::Event,
-                                    None,
-                                    None,
-                                    Some(serde_json::Value::String(format!("Unknown: {:?}", err))),
-                                ),
-                                worker_read_guard.clone(),
-                                worker_write_guard.clone(),
-                            )
-                            .await;
-                            break;
-                        }
-                    },
-                };
-
-                match frame.opcode {
-                    OpCode::Text | OpCode::Binary => {
-                        let text = String::from_utf8(frame.payload.to_vec());
-
-                        let text = match text {
-                            Ok(text) => text,
-                            Err(_) => continue,
-                        };
-
-                        let listener_guard = listener_guard.lock().await;
-
-                        let packet = Packet::decode(text);
-
-                        if packet.is_err() {
-                            continue;
-                        }
-
-                        let packet = Arc::new(packet.unwrap());
-
-                        if packet.packet_type == PacketType::Connect {
-                            if let Some(listeners) = listener_guard.get("handshake") {
-                                listeners.iter().for_each(|listener| {
-                                    safe_spawn(listener(
-                                        packet.clone(),
-                                        worker_read_guard.clone(),
-                                        worker_write_guard.clone(),
-                                    ));
-                                });
-                            }
-                        }
-
-                        if let Some(target) = &packet.target {
-                            if let Some(listeners) = listener_guard.get(target) {
-                                listeners.iter().for_each(|listener| {
-                                    safe_spawn(listener(
-                                        packet.clone(),
-                                        worker_read_guard.clone(),
-                                        worker_write_guard.clone(),
-                                    ));
-                                });
-                            }
-                        }
-
-                        if let Some(wildcard_listener) = wildcard_listener.clone() {
-                            safe_spawn(wildcard_listener(
-                                packet.clone(),
-                                worker_read_guard.clone(),
-                                worker_write_guard.clone(),
-                            ));
-                        }
-                    }
-                    OpCode::Close => {
-                        safe_spawn(Self::emit_raw(
-                            "close",
-                            listener_guard.clone(),
-                            wildcard_listener.clone(),
-                            Packet::new(
-                                PacketType::Event,
-                                None,
-                                None,
-                                Some(serde_json::Value::String("Close".to_owned())),
-                            ),
-                            worker_read_guard.clone(),
-                            worker_write_guard.clone(),
-                        ));
-                        break;
-                    }
-                    _ => { /* Ignore */ }
-                }
-            }
-        });
-
-        let worker_handle = tokio::spawn(task);
-
-        self.worker_handles = Some((worker_handle, handle));
+        Self::initialize_worker_raw(
+            self.worker_handle.clone(),
+            self.read.clone(),
+            self.write.clone(),
+            self.wildcard_listener.clone(),
+            self.listeners.clone(),
+        )
+        .await;
     }
 
     async fn start_ping_worker(&mut self) {
+        if self.ping_worker_handle.lock().await.is_some() {
+            let _ = self.stop_ping_worker().await;
+        }
+
         let ping_write = self.write.clone();
 
         let ping_read_guard = self.read();
@@ -286,9 +117,9 @@ impl Socket {
             }
         });
 
-        let ping_handle = tokio::spawn(task);
+        safe_spawn(task);
 
-        self.ping_worker_handles = Some((ping_handle, handle));
+        *self.ping_worker_handle.lock().await = Some(handle);
     }
 
     pub fn run_background(mut self) {
@@ -516,52 +347,81 @@ impl Socket {
         }
     }
 
-    pub async fn stop_ping_worker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some((_, abort_handle)) = self.ping_worker_handles.take() {
+    pub async fn stop_ping_worker(&mut self) {
+        Self::stop_ping_worker_raw(
+            self.ping_worker_handle.clone(),
+            self.listeners.clone(),
+            self.wildcard_listener.clone(),
+            self.read.clone(),
+            self.write.clone(),
+        )
+        .await
+    }
+
+    pub async fn stop_ping_worker_raw(
+        worker_handle: Arc<Mutex<Option<AbortHandle>>>,
+        listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
+        wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
+        read: Arc<Mutex<SocketReadStream>>,
+        write: Arc<Mutex<SocketWriteSink>>,
+    ) {
+        if let Some(abort_handle) = worker_handle.lock().await.take() {
             abort_handle.abort();
             safe_spawn(Self::emit_raw(
                 "worker:stopped",
-                self.listeners.clone(),
-                self.wildcard_listener.clone(),
+                listeners.clone(),
+                wildcard_listener.clone(),
                 Packet::new(
                     PacketType::Event,
                     None,
                     None,
                     Some(serde_json::Value::String("ping".to_owned())),
                 ),
-                self.read(),
-                self.write(),
+                read.clone(),
+                write.clone(),
             ));
         }
-
-        Ok(())
     }
 
-    pub async fn stop_listener_worker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some((_, abort_handle)) = self.worker_handles.take() {
+    pub async fn stop_listener_worker(&mut self) {
+        Self::stop_listener_worker_raw(
+            self.worker_handle.clone(),
+            self.listeners.clone(),
+            self.wildcard_listener.clone(),
+            self.read.clone(),
+            self.write.clone(),
+        )
+        .await
+    }
+
+    pub async fn stop_listener_worker_raw(
+        worker_handle: Arc<Mutex<Option<AbortHandle>>>,
+        listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
+        wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
+        read: Arc<Mutex<SocketReadStream>>,
+        write: Arc<Mutex<SocketWriteSink>>,
+    ) {
+        if let Some(abort_handle) = worker_handle.lock().await.take() {
             abort_handle.abort();
             safe_spawn(Self::emit_raw(
                 "worker:stopped",
-                self.listeners.clone(),
-                self.wildcard_listener.clone(),
+                listeners,
+                wildcard_listener,
                 Packet::new(
                     PacketType::Event,
                     None,
                     None,
                     Some(serde_json::Value::String("listener".to_owned())),
                 ),
-                self.read(),
-                self.write(),
+                read,
+                write,
             ));
         }
-
-        Ok(())
     }
 
-    pub async fn stop_workers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.stop_ping_worker().await?;
-        self.stop_listener_worker().await?;
-        Ok(())
+    pub async fn stop_workers(&mut self) {
+        self.stop_ping_worker().await;
+        self.stop_listener_worker().await;
     }
 
     pub fn reconnect_configuration(&mut self, configuration: ReconnectConfiguration) -> &mut Self {
@@ -584,23 +444,38 @@ impl Socket {
             return Err("Reconnect is disabled".into());
         }
 
-        self.stop_listener_worker().await?;
+        self.stop_listener_worker().await;
 
-        Self::reconnect_raw(self.read.clone(), self.write.clone(), configuration.clone()).await?;
+        let ping_interval = match self.handshake_response.as_ref() {
+            Some(handshake_response) => handshake_response.ping_interval,
+            None => 25_000,
+        };
+
+        Self::reconnect_raw(
+            self.read.clone(),
+            self.write.clone(),
+            configuration.clone(),
+            Some(self.listeners.clone()),
+            self.wildcard_listener.clone(),
+            Some(self.worker_handle.clone()),
+            Some(self.ping_worker_handle.clone()),
+            Some(ping_interval),
+        )
+        .await?;
 
         self.emit(
             "socket:connect".to_owned(),
             Packet::new(
                 PacketType::Event,
                 None,
-                Some("socket:connect".to_owned()),
+                None,
                 Some(serde_json::Value::String("socket:connect".to_owned())),
             ),
         )
         .await;
 
         if configuration.force_handshake {
-            self.stop_ping_worker().await?;
+            self.stop_ping_worker().await;
             self.handshake().await?;
             self.start_ping_worker().await;
         }
@@ -636,9 +511,40 @@ impl Socket {
         read: Arc<Mutex<SocketReadStream>>,
         write: Arc<Mutex<SocketWriteSink>>,
         configuration: ReconnectConfiguration,
+        listeners: Option<Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>>,
+        wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
+        worker_handle: Option<Arc<Mutex<Option<AbortHandle>>>>,
+        ping_worker_handle: Option<Arc<Mutex<Option<AbortHandle>>>>,
+        ping_interval: Option<u64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !configuration.enable_reconnect {
             return Err("Reconnect is disabled".into());
+        }
+
+        if let Some(worker_handle) = worker_handle.clone() {
+            if worker_handle.lock().await.is_some() {
+                let _ = Self::stop_listener_worker_raw(
+                    worker_handle.clone(),
+                    listeners.clone().unwrap(),
+                    wildcard_listener.clone(),
+                    read.clone(),
+                    write.clone(),
+                )
+                .await;
+            }
+        }
+
+        if let Some(ping_worker_handle) = ping_worker_handle.clone() {
+            if ping_worker_handle.lock().await.is_some() {
+                let _ = Self::stop_ping_worker_raw(
+                    ping_worker_handle.clone(),
+                    listeners.clone().unwrap(),
+                    wildcard_listener.clone(),
+                    read.clone(),
+                    write.clone(),
+                )
+                .await;
+            }
         }
 
         let mut read_guard = read.lock().await;
@@ -679,6 +585,271 @@ impl Socket {
         drop(read_guard);
         drop(write_guard);
 
+        if let Some(listeners) = listeners.clone() {
+            if let Some(worker_handle) = worker_handle.clone() {
+                Self::initialize_worker_raw(
+                    worker_handle,
+                    read.clone(),
+                    write.clone(),
+                    wildcard_listener.clone(),
+                    listeners.clone(),
+                )
+                .await;
+            }
+
+            if let Some(ping_worker_handle) = ping_worker_handle.clone() {
+                Self::initialize_ping_worker_raw(
+                    ping_interval.unwrap_or(25_000),
+                    ping_worker_handle,
+                    read.clone(),
+                    write.clone(),
+                    listeners.clone(),
+                    wildcard_listener,
+                )
+                .await;
+            }
+        }
+
         Ok(())
+    }
+
+    pub async fn initialize_worker_raw(
+        target: Arc<Mutex<Option<AbortHandle>>>,
+        read: Arc<Mutex<SocketReadStream>>,
+        write: Arc<Mutex<SocketWriteSink>>,
+        wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
+        listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
+    ) {
+        let mut target_lock = target.lock().await;
+
+        if target_lock.is_some() {
+            let target_value = std::mem::replace(&mut *target_lock, None);
+            target_value.unwrap().abort();
+        }
+
+        let (task, handle) = abortable(async move {
+            loop {
+                let mut frame = read.lock().await;
+
+                let frame = frame
+                    .read_frame::<_, WebSocketError>(&mut |frame| async move {
+                        match frame.opcode {
+                            OpCode::Close => Ok(()),
+                            _ => Err(WebSocketError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "Listener failed",
+                            ))),
+                        }
+                    })
+                    .await;
+
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(e) => match e {
+                        WebSocketError::IoError(e) => {
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                Self::emit_raw(
+                                    "close",
+                                    listeners.clone(),
+                                    wildcard_listener.clone(),
+                                    Packet::new(
+                                        PacketType::Event,
+                                        None,
+                                        None,
+                                        Some(serde_json::Value::String(
+                                            "Unexpected EOF".to_owned(),
+                                        )),
+                                    ),
+                                    read.clone(),
+                                    write.clone(),
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                        WebSocketError::UnexpectedEOF => {
+                            Self::emit_raw(
+                                "close",
+                                listeners.clone(),
+                                wildcard_listener.clone(),
+                                Packet::new(
+                                    PacketType::Event,
+                                    None,
+                                    None,
+                                    Some(serde_json::Value::String("Unexpected EOF".to_owned())),
+                                ),
+                                read.clone(),
+                                write.clone(),
+                            )
+                            .await;
+                            break;
+                        }
+                        err => {
+                            Self::emit_raw(
+                                "close",
+                                listeners.clone(),
+                                wildcard_listener.clone(),
+                                Packet::new(
+                                    PacketType::Event,
+                                    None,
+                                    None,
+                                    Some(serde_json::Value::String(format!("Unknown: {:?}", err))),
+                                ),
+                                read.clone(),
+                                write.clone(),
+                            )
+                            .await;
+                            break;
+                        }
+                    },
+                };
+
+                match frame.opcode {
+                    OpCode::Text | OpCode::Binary => {
+                        let text = String::from_utf8(frame.payload.to_vec());
+
+                        let text = match text {
+                            Ok(text) => text,
+                            Err(_) => continue,
+                        };
+
+                        let listener_guard = listeners.lock().await;
+
+                        let packet = Packet::decode(text);
+
+                        if packet.is_err() {
+                            continue;
+                        }
+
+                        let packet = Arc::new(packet.unwrap());
+
+                        if packet.packet_type == PacketType::Connect {
+                            if let Some(listeners) = listener_guard.get("handshake") {
+                                listeners.iter().for_each(|listener| {
+                                    safe_spawn(listener(
+                                        packet.clone(),
+                                        read.clone(),
+                                        write.clone(),
+                                    ));
+                                });
+                            }
+                        }
+
+                        if let Some(target) = &packet.target {
+                            if let Some(listeners) = listener_guard.get(target) {
+                                listeners.iter().for_each(|listener| {
+                                    safe_spawn(listener(
+                                        packet.clone(),
+                                        read.clone(),
+                                        write.clone(),
+                                    ));
+                                });
+                            }
+                        }
+
+                        if let Some(wildcard_listener) = wildcard_listener.clone() {
+                            safe_spawn(wildcard_listener(
+                                packet.clone(),
+                                read.clone(),
+                                write.clone(),
+                            ));
+                        }
+                    }
+                    OpCode::Close => {
+                        safe_spawn(Self::emit_raw(
+                            "close",
+                            listeners.clone(),
+                            wildcard_listener.clone(),
+                            Packet::new(
+                                PacketType::Event,
+                                None,
+                                None,
+                                Some(serde_json::Value::String("Close".to_owned())),
+                            ),
+                            read.clone(),
+                            write.clone(),
+                        ));
+                        break;
+                    }
+                    _ => { /* Ignore */ }
+                }
+            }
+        });
+
+        safe_spawn(task);
+
+        drop(std::mem::replace(&mut *target_lock, Some(handle)));
+    }
+
+    pub async fn initialize_ping_worker_raw(
+        ping_interval: u64,
+        target: Arc<Mutex<Option<AbortHandle>>>,
+        read: Arc<Mutex<SocketReadStream>>,
+        write: Arc<Mutex<SocketWriteSink>>,
+        listeners: Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>>,
+        wildcard_listener: Option<Arc<Box<SocketListenerFn>>>,
+    ) {
+        let mut target_lock = target.lock().await;
+
+        if target_lock.is_some() {
+            let target_value = std::mem::replace(&mut *target_lock, None);
+            target_value.unwrap().abort();
+        }
+
+        let (task, handle) = abortable(async move {
+            let ping_interval = std::time::Duration::from_millis(ping_interval);
+
+            loop {
+                safe_spawn(Self::emit_raw(
+                    "ping",
+                    listeners.clone(),
+                    wildcard_listener.clone(),
+                    Packet::new(PacketType::Ping, None, None, None),
+                    read.clone(),
+                    write.clone(),
+                ));
+
+                let ping_result = Self::inner_ping(write.clone()).await;
+
+                if ping_result.is_err() {
+                    continue;
+                }
+
+                safe_spawn(Self::emit_raw(
+                    "pong",
+                    listeners.clone(),
+                    wildcard_listener.clone(),
+                    Packet::new(PacketType::Ping, None, None, None),
+                    read.clone(),
+                    write.clone(),
+                ));
+
+                thread::sleep(ping_interval);
+            }
+        });
+
+        safe_spawn(task);
+
+        drop(std::mem::replace(&mut *target_lock, Some(handle)));
+    }
+
+    pub fn listeners(&self) -> Arc<Mutex<HashMap<String, Vec<Box<SocketListenerFn>>>>> {
+        self.listeners.clone()
+    }
+
+    pub fn wildcard_listener(&self) -> Option<Arc<Box<SocketListenerFn>>> {
+        self.wildcard_listener.clone()
+    }
+
+    pub fn handshake_response(&self) -> Option<&Handshake> {
+        self.handshake_response.as_ref()
+    }
+
+    pub fn worker_handle(&self) -> Arc<Mutex<Option<AbortHandle>>> {
+        self.worker_handle.clone()
+    }
+
+    pub fn ping_worker_handle(&self) -> Arc<Mutex<Option<AbortHandle>>> {
+        self.ping_worker_handle.clone()
     }
 }
