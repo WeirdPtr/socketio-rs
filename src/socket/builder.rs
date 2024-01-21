@@ -273,18 +273,9 @@ impl SocketBuilder {
 
     #[cfg(feature = "proxy")]
     async fn establish_tunnel<'a>(&self, uri: &'a str) -> Result<TcpStream, std::io::Error> {
-        let proxy_str = self.proxy.clone().unwrap_or(
-            std::env::var("HTTP_PROXY")
-                .unwrap_or(std::env::var("HTTPS_PROXY").unwrap_or(String::new()))
-                .to_owned(),
-        );
-
-        if proxy_str.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "No proxy provided",
-            ));
-        }
+        let proxy_str = self.resolve_proxy().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "No proxy provided")
+        })?;
 
         let stream = TcpProxy::from_proxy_str(proxy_str.as_str())?
             .connect(uri)
@@ -322,11 +313,11 @@ impl SocketBuilder {
         #[cfg(feature = "proxy")]
         let stream = match stream {
             Ok(stream) => stream,
-            Err(e) => {
+            Err(err) => {
                 if self.ignore_invalid_proxy {
                     TcpStream::connect(Self::get_tcp_connect_str(&self.request).as_str()).await?
                 } else {
-                    return Err(Box::new(e));
+                    return Err(Box::new(err));
                 }
             }
         };
@@ -343,8 +334,23 @@ impl SocketBuilder {
         Ok((read, write))
     }
 
+    #[cfg(feature = "proxy")]
+    fn resolve_proxy(&self) -> Option<String> {
+        match self.ignore_proxy_env_vars {
+            true => self.proxy.clone(),
+            false => self.proxy.clone().or_else(|| {
+                std::env::var("HTTP_PROXY")
+                    .ok()
+                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
+            }),
+        }
+    }
+
     pub async fn connect(self) -> Result<Socket, Box<dyn std::error::Error>> {
         let (read, write) = self.inner_connect().await?;
+
+        #[cfg(feature = "proxy")]
+        let resolved_proxy = self.resolve_proxy();
 
         let listeners = Arc::new(Mutex::new(self.listeners));
 
@@ -379,7 +385,7 @@ impl SocketBuilder {
             #[cfg(feature = "proxy")]
             ignore_proxy_env_vars: self.ignore_proxy_env_vars,
             #[cfg(feature = "proxy")]
-            proxy: self.proxy,
+            proxy: resolved_proxy,
         };
 
         let mut socket = Socket::new(read, write, Some(listeners), self.wildcard_listener);
