@@ -10,7 +10,6 @@ use futures_util::{
     future::{abortable, BoxFuture},
     lock::Mutex,
     stream::AbortHandle,
-    FutureExt,
 };
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -244,14 +243,14 @@ impl Socket {
         let mut handshake_response_frame = self.read.lock().await;
 
         let handshake_response_frame = handshake_response_frame
-            .read_frame::<_, WebSocketError>(&mut |_| {
-                async {
-                    Err(WebSocketError::IoError(std::io::Error::new(
+            .read_frame::<_, WebSocketError>(&mut |frame| async move {
+                match frame.opcode {
+                    OpCode::Text | OpCode::Binary => Ok(()),
+                    _ => Err(WebSocketError::IoError(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "Handshake failed",
-                    )))
+                    ))),
                 }
-                .boxed()
             })
             .await?;
 
@@ -451,7 +450,7 @@ impl Socket {
             None => 25_000,
         };
 
-        Self::reconnect_raw(
+        let reconnect_succesful = Self::reconnect_raw(
             self.read.clone(),
             self.write.clone(),
             configuration.clone(),
@@ -460,8 +459,13 @@ impl Socket {
             Some(self.worker_handle.clone()),
             Some(self.ping_worker_handle.clone()),
             Some(ping_interval),
+            false,
         )
-        .await?;
+        .await;
+
+        if !reconnect_succesful {
+            return Err("Reconnect failed".into());
+        }
 
         self.emit(
             "socket:connect".to_owned(),
@@ -516,35 +520,10 @@ impl Socket {
         worker_handle: Option<Arc<Mutex<Option<AbortHandle>>>>,
         ping_worker_handle: Option<Arc<Mutex<Option<AbortHandle>>>>,
         ping_interval: Option<u64>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        ignore_ping_worker: bool,
+    ) -> bool {
         if !configuration.enable_reconnect {
-            return Err("Reconnect is disabled".into());
-        }
-
-        if let Some(worker_handle) = worker_handle.clone() {
-            if worker_handle.lock().await.is_some() {
-                let _ = Self::stop_listener_worker_raw(
-                    worker_handle.clone(),
-                    listeners.clone().unwrap(),
-                    wildcard_listener.clone(),
-                    read.clone(),
-                    write.clone(),
-                )
-                .await;
-            }
-        }
-
-        if let Some(ping_worker_handle) = ping_worker_handle.clone() {
-            if ping_worker_handle.lock().await.is_some() {
-                let _ = Self::stop_ping_worker_raw(
-                    ping_worker_handle.clone(),
-                    listeners.clone().unwrap(),
-                    wildcard_listener.clone(),
-                    read.clone(),
-                    write.clone(),
-                )
-                .await;
-            }
+            return false;
         }
 
         let mut read_guard = read.lock().await;
@@ -574,10 +553,10 @@ impl Socket {
                 continue;
             }
 
-            let (read, write) = response.unwrap();
+            let (new_read, new_write) = response.unwrap();
 
-            drop(std::mem::replace(&mut *read_guard, read));
-            drop(std::mem::replace(&mut *write_guard, write));
+            drop(std::mem::replace(&mut *read_guard, new_read));
+            drop(std::mem::replace(&mut *write_guard, new_write));
 
             break;
         }
@@ -597,20 +576,33 @@ impl Socket {
                 .await;
             }
 
-            if let Some(ping_worker_handle) = ping_worker_handle.clone() {
-                Self::initialize_ping_worker_raw(
-                    ping_interval.unwrap_or(25_000),
-                    ping_worker_handle,
-                    read.clone(),
-                    write.clone(),
-                    listeners.clone(),
-                    wildcard_listener,
-                )
-                .await;
+            Socket::emit_raw(
+                "socket:reconnect",
+                listeners.clone(),
+                wildcard_listener.clone(),
+                Packet::new(PacketType::Event, None, None, None),
+                read.clone(),
+                write.clone(),
+            )
+            .await;
+
+            if !ignore_ping_worker {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(5_000)).await;
+                    let _ = Self::initialize_ping_worker_raw(
+                        ping_interval.unwrap_or(25_000),
+                        ping_worker_handle.unwrap(),
+                        read.clone(),
+                        write.clone(),
+                        listeners.clone(),
+                        wildcard_listener.clone(),
+                    )
+                    .await;
+                });
             }
         }
 
-        Ok(())
+        true
     }
 
     pub async fn initialize_worker_raw(
@@ -623,8 +615,7 @@ impl Socket {
         let mut target_lock = target.lock().await;
 
         if target_lock.is_some() {
-            let target_value = std::mem::replace(&mut *target_lock, None);
-            target_value.unwrap().abort();
+            std::mem::replace(&mut *target_lock, None).unwrap().abort();
         }
 
         let (task, handle) = abortable(async move {
@@ -634,7 +625,7 @@ impl Socket {
                 let frame = frame
                     .read_frame::<_, WebSocketError>(&mut |frame| async move {
                         match frame.opcode {
-                            OpCode::Close => Ok(()),
+                            OpCode::Text | OpCode::Binary | OpCode::Close => Ok(()),
                             _ => Err(WebSocketError::IoError(std::io::Error::new(
                                 std::io::ErrorKind::Other,
                                 "Listener failed",
@@ -792,8 +783,7 @@ impl Socket {
         let mut target_lock = target.lock().await;
 
         if target_lock.is_some() {
-            let target_value = std::mem::replace(&mut *target_lock, None);
-            target_value.unwrap().abort();
+            std::mem::replace(&mut *target_lock, None).unwrap().abort();
         }
 
         let (task, handle) = abortable(async move {
@@ -824,7 +814,7 @@ impl Socket {
                     write.clone(),
                 ));
 
-                thread::sleep(ping_interval);
+                tokio::time::sleep(ping_interval).await;
             }
         });
 
